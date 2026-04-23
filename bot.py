@@ -37,12 +37,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Configuration ───────────────────────────────────────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8633516655:AAEyh_6S3qaCfHJL7DEtkePSlfcNBCYep_8")
 
 # Admins (Telegram user IDs) who can use admin commands
 ADMIN_IDS: set[int] = {
-    # Add your Telegram user IDs here, e.g.:
-    # 123456789, 987654321
+    6171782909,  # Owner
 }
 
 # Spam / moderation settings
