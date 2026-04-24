@@ -1,538 +1,280 @@
-"""
-WBTC Community Telegram Admin Bot
-Full-featured moderation, info, and utility bot for the WBTC community.
-"""
-
 import logging
 import os
-import re
-import asyncio
+import json
 from datetime import datetime, timedelta
-from typing import Optional
-
-import aiohttp
-from telegram import (
-    Update,
-    ChatPermissions,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ChatMemberUpdated,
-)
+import pytz
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ChatMemberHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, filters, ContextTypes, ConversationHandler
 )
-from telegram.constants import ParseMode
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+import requests
 
-# ─── Logging ────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
+# ── All config from environment variables ONLY — no hardcoded secrets ──────────
+TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
+SLACK_WEBHOOK   = os.environ["SLACK_WEBHOOK"]
+CALENDAR_ID     = os.environ["CALENDAR_ID"]
+FIXED_ATTENDEES = ["sherry.wang@tron.network", "nadia.song@wbtc.network"]
+SGT             = pytz.timezone("Asia/Singapore")
+BOOKING_START   = 10
+BOOKING_END     = 20
+
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ─── Configuration ───────────────────────────────────────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8633516655:AAEyh_6S3qaCfHJL7DEtkePSlfcNBCYep_8")
-
-# Admins (Telegram user IDs) who can use admin commands
-ADMIN_IDS: set[int] = {
-    6171782909,  # Owner
-}
-
-# Spam / moderation settings
-SPAM_KEYWORDS = [
-    "airdrop", "giveaway", "free btc", "free wbtc", "click here",
-    "earn 10x", "guaranteed profit", "investment opportunity",
-    "dm me", "message me for", "telegram.me/", "t.me/joinchat",
-    "crypto pump", "presale", "rug", "honeypot",
-]
-
-MAX_WARNINGS = 3          # Warnings before auto-ban
-MUTE_DURATION_MIN = 10    # Minutes for mute on warning 2
-NEW_MEMBER_MUTE_MIN = 5   # Minutes new members are muted after join
-
-# In-memory warning store  {user_id: warning_count}
-warnings: dict[int, int] = {}
-
-# ─── Helpers ─────────────────────────────────────────────────────────────────
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+ASK_TYPE, ASK_AMOUNT, ASK_WALLET, ASK_EMAIL, ASK_MERCHANT, ASK_DATE, ASK_TIME, ASK_CONFIRM = range(8)
 
 
-async def get_chat_admin_ids(update: Update, context: ContextTypes.DEFAULT_TYPE) -> list[int]:
-    admins = await context.bot.get_chat_administrators(update.effective_chat.id)
-    return [a.user.id for a in admins]
-
-
-async def is_chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    admin_ids = await get_chat_admin_ids(update, context)
-    return update.effective_user.id in admin_ids or is_admin(update.effective_user.id)
-
-
-async def safe_delete(update: Update) -> None:
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-
-
-# ─── Welcome Message ─────────────────────────────────────────────────────────
-
-async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Welcome new members and mute them briefly to reduce spam."""
-    result: ChatMemberUpdated = update.chat_member
-    if result.new_chat_member.status not in ("member", "restricted"):
-        return
-
-    user = result.new_chat_member.user
-    chat = update.effective_chat
-
-    # Temporarily mute new member
-    mute_until = datetime.utcnow() + timedelta(minutes=NEW_MEMBER_MUTE_MIN)
-    try:
-        await context.bot.restrict_chat_member(
-            chat_id=chat.id,
-            user_id=user.id,
-            permissions=ChatPermissions(can_send_messages=False),
-            until_date=mute_until,
-        )
-    except Exception as e:
-        logger.warning(f"Could not mute new member: {e}")
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📖 What is WBTC?", callback_data="info_wbtc"),
-         InlineKeyboardButton("📜 Rules", callback_data="info_rules")],
-        [InlineKeyboardButton("💰 WBTC Price", callback_data="info_price")],
-    ])
-
-    await context.bot.send_message(
-        chat_id=chat.id,
-        text=(
-            f"👋 Welcome, [{user.first_name}](tg://user?id={user.id})!\n\n"
-            f"You've joined the *WBTC Community*. You'll be able to chat in {NEW_MEMBER_MUTE_MIN} minutes.\n\n"
-            "Please read the rules and enjoy your stay! 🧡"
-        ),
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=keyboard,
-    )
-
-
-# ─── Spam / Moderation ────────────────────────────────────────────────────────
-
-async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Check messages for spam keywords and take action."""
-    if not update.message or not update.effective_user:
-        return
-
-    user = update.effective_user
-    text = (update.message.text or update.message.caption or "").lower()
-
-    # Skip admins
-    if await is_chat_admin(update, context):
-        return
-
-    # Check for spam keywords
-    triggered = [kw for kw in SPAM_KEYWORDS if kw in text]
-
-    # Check for excessive links
-    link_count = len(re.findall(r"https?://", text))
-
-    if triggered or link_count > 2:
-        await safe_delete(update)
-        await add_warning(update, context, user.id, user.first_name, reason=f"spam/links ({', '.join(triggered)})")
-        return
-
-    # Check for all-caps abuse (>15 chars, >80% caps)
-    if len(text) > 15 and sum(1 for c in text if c.isupper()) / max(len(text), 1) > 0.8:
-        await safe_delete(update)
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"⚠️ {user.first_name}, please don't shout (ALL CAPS). Message removed.",
-        )
-
-
-async def add_warning(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
-    user_name: str,
-    reason: str = "rule violation",
-) -> None:
-    warnings[user_id] = warnings.get(user_id, 0) + 1
-    count = warnings[user_id]
-    chat_id = update.effective_chat.id
-
-    if count >= MAX_WARNINGS:
-        # Ban
-        await context.bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"🚫 *{user_name}* has been *banned* after {MAX_WARNINGS} warnings. Reason: {reason}.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        warnings.pop(user_id, None)
-    elif count == 2:
-        # Mute
-        mute_until = datetime.utcnow() + timedelta(minutes=MUTE_DURATION_MIN)
-        await context.bot.restrict_chat_member(
-            chat_id=chat_id,
-            user_id=user_id,
-            permissions=ChatPermissions(can_send_messages=False),
-            until_date=mute_until,
-        )
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"⚠️ *{user_name}* — Warning {count}/{MAX_WARNINGS}.\n"
-                f"Muted for {MUTE_DURATION_MIN} minutes. Reason: {reason}."
-            ),
-            parse_mode=ParseMode.MARKDOWN,
+def get_calendar_service():
+    # Railway/cloud: paste full JSON contents into GOOGLE_CREDENTIALS env var
+    # Local dev: set GOOGLE_CREDS_FILE to path of credentials.json
+    raw = os.environ.get("GOOGLE_CREDENTIALS")
+    if raw:
+        creds = service_account.Credentials.from_service_account_info(
+            json.loads(raw), scopes=["https://www.googleapis.com/auth/calendar"]
         )
     else:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"⚠️ *{user_name}* — Warning {count}/{MAX_WARNINGS}.\n"
-                f"Reason: {reason}. One more and you'll be muted."
-            ),
-            parse_mode=ParseMode.MARKDOWN,
+        creds = service_account.Credentials.from_service_account_file(
+            os.environ.get("GOOGLE_CREDS_FILE", "credentials.json"),
+            scopes=["https://www.googleapis.com/auth/calendar"]
         )
+    return build("calendar", "v3", credentials=creds)
 
 
-# ─── Admin Commands ───────────────────────────────────────────────────────────
-
-async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await is_chat_admin(update, context):
-        return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("↩️ Reply to a user's message to ban them.")
-        return
-    target = update.message.reply_to_message.from_user
-    await context.bot.ban_chat_member(update.effective_chat.id, target.id)
-    await update.message.reply_text(f"🚫 {target.first_name} has been banned.")
-
-
-async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await is_chat_admin(update, context):
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /unban <user_id>")
-        return
-    user_id = int(context.args[0])
-    await context.bot.unban_chat_member(update.effective_chat.id, user_id)
-    await update.message.reply_text(f"✅ User {user_id} has been unbanned.")
-
-
-async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await is_chat_admin(update, context):
-        return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("↩️ Reply to a user's message to mute them.")
-        return
-    target = update.message.reply_to_message.from_user
-    minutes = int(context.args[0]) if context.args else 60
-    mute_until = datetime.utcnow() + timedelta(minutes=minutes)
-    await context.bot.restrict_chat_member(
-        chat_id=update.effective_chat.id,
-        user_id=target.id,
-        permissions=ChatPermissions(can_send_messages=False),
-        until_date=mute_until,
-    )
-    await update.message.reply_text(f"🔇 {target.first_name} muted for {minutes} minutes.")
-
-
-async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await is_chat_admin(update, context):
-        return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("↩️ Reply to a user's message to unmute them.")
-        return
-    target = update.message.reply_to_message.from_user
-    await context.bot.restrict_chat_member(
-        chat_id=update.effective_chat.id,
-        user_id=target.id,
-        permissions=ChatPermissions(
-            can_send_messages=True,
-            can_send_other_messages=True,
-            can_add_web_page_previews=True,
+def create_calendar_event(data):
+    service  = get_calendar_service()
+    dt_start = data["datetime"]
+    dt_end   = dt_start + timedelta(hours=1)
+    attendees = [{"email": e} for e in FIXED_ATTENDEES]
+    if data["email"].lower() not in [a["email"].lower() for a in attendees]:
+        attendees.append({"email": data["email"]})
+    event = {
+        "summary": f"WBTC {data['type'].upper()} — {data['merchant']}",
+        "description": (
+            f"Request Type: {data['type'].upper()}\n"
+            f"Merchant: {data['merchant']}\n"
+            f"Amount: {data['amount']} BTC\n"
+            f"Wallet: {data['wallet']}\n"
+            f"Email: {data['email']}\n"
+            f"Submitted via WBTC Support Bot"
         ),
-    )
-    await update.message.reply_text(f"🔊 {target.first_name} has been unmuted.")
+        "start": {"dateTime": dt_start.isoformat(), "timeZone": "Asia/Singapore"},
+        "end":   {"dateTime": dt_end.isoformat(),   "timeZone": "Asia/Singapore"},
+        "attendees": attendees,
+        "reminders": {"useDefault": False, "overrides": [
+            {"method": "email", "minutes": 60},
+            {"method": "popup", "minutes": 15},
+        ]},
+    }
+    created = service.events().insert(
+        calendarId=CALENDAR_ID, body=event, sendUpdates="all"
+    ).execute()
+    return created.get("htmlLink", "")
 
 
-async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await is_chat_admin(update, context):
-        return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("↩️ Reply to a user's message to warn them.")
-        return
-    target = update.message.reply_to_message.from_user
-    reason = " ".join(context.args) if context.args else "no reason given"
-    await add_warning(update, context, target.id, target.first_name, reason)
+def send_slack(data, cal_link):
+    emoji  = "🟢" if data["type"] == "mint" else "🔴"
+    dt_str = data["datetime"].strftime("%d %b %Y, %I:%M %p SGT")
+    requests.post(SLACK_WEBHOOK, json={"blocks": [
+        {"type": "header", "text": {"type": "plain_text", "text": f"{emoji} New WBTC {data['type'].upper()} Request", "emoji": True}},
+        {"type": "section", "fields": [
+            {"type": "mrkdwn", "text": f"*Merchant:*\n{data['merchant']}"},
+            {"type": "mrkdwn", "text": f"*Type:*\n{data['type'].upper()}"},
+            {"type": "mrkdwn", "text": f"*Amount:*\n{data['amount']} BTC"},
+            {"type": "mrkdwn", "text": f"*Scheduled:*\n{dt_str}"},
+            {"type": "mrkdwn", "text": f"*Wallet:*\n`{data['wallet']}`"},
+            {"type": "mrkdwn", "text": f"*Email:*\n{data['email']}"},
+        ]},
+        {"type": "actions", "elements": [
+            {"type": "button", "text": {"type": "plain_text", "text": "View Calendar Event"},
+             "url": cal_link, "style": "primary"}
+        ]},
+    ]}, timeout=10)
 
 
-async def cmd_warnings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await is_chat_admin(update, context):
-        return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("↩️ Reply to a user's message to check their warnings.")
-        return
-    target = update.message.reply_to_message.from_user
-    count = warnings.get(target.id, 0)
-    await update.message.reply_text(f"⚠️ {target.first_name} has {count}/{MAX_WARNINGS} warnings.")
+def date_keyboard():
+    now, rows, row = datetime.now(SGT), [], []
+    for i in range(1, 8):
+        day = now + timedelta(days=i)
+        row.append(InlineKeyboardButton(
+            day.strftime("%a %d %b"), callback_data=f"date_{day.strftime('%Y-%m-%d')}"
+        ))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("Cancel", callback_data="cancel")])
+    return InlineKeyboardMarkup(rows)
 
 
-async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await is_chat_admin(update, context):
-        return
-    if update.message.reply_to_message:
-        await update.message.reply_to_message.delete()
-    await update.message.delete()
-
-
-async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await is_chat_admin(update, context):
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /announce <message>")
-        return
-    text = "📢 *ANNOUNCEMENT*\n\n" + " ".join(context.args)
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=text,
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    await update.message.delete()
-
-
-# ─── Info Commands ────────────────────────────────────────────────────────────
-
-WBTC_INFO = """
-🟠 *What is WBTC (Wrapped Bitcoin)?*
-
-WBTC is an ERC-20 token on Ethereum that is backed 1:1 with Bitcoin.
-
-• 1 WBTC = 1 BTC (always)
-• Enables Bitcoin liquidity on Ethereum DeFi
-• Fully audited & transparent reserves
-• Managed by the WBTC DAO
-
-🔗 *Official Links:*
-• Website: [wbtc.network](https://wbtc.network)
-• CoinGecko: [wbtc on CoinGecko](https://www.coingecko.com/en/coins/wrapped-bitcoin)
-• Contract: `0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599`
-"""
-
-RULES_TEXT = """
-📜 *WBTC Community Rules*
-
-1️⃣ No spam, scams, or phishing links
-2️⃣ No unsolicited DMs — report them to admins
-3️⃣ No price manipulation / pump talk
-4️⃣ Be respectful to all members
-5️⃣ English only in main chat
-6️⃣ No posting of competitor token promotions
-7️⃣ No sharing of unverified contract addresses
-8️⃣ Admins have final say — follow instructions
-
-⚠️ Violations result in warnings → mute → ban.
-"""
-
-FAQ_TEXT = """
-❓ *WBTC FAQ*
-
-*Q: Is WBTC safe?*
-A: WBTC is audited and reserves are verifiable on-chain.
-
-*Q: How do I mint/redeem WBTC?*
-A: Through authorized merchants listed at wbtc.network
-
-*Q: Is WBTC the same as BTC?*
-A: It tracks BTC 1:1 but lives on Ethereum.
-
-*Q: What wallets support WBTC?*
-A: Any ERC-20 compatible wallet (MetaMask, Ledger, etc.)
-
-*Q: Where can I trade WBTC?*
-A: Major DEXes (Uniswap, Curve) and CEXes (Binance, Coinbase).
-"""
-
-LINKS_TEXT = """
-🔗 *Official WBTC Links*
-
-🌐 Website: [wbtc.network](https://wbtc.network)
-📊 CoinGecko: [WBTC](https://www.coingecko.com/en/coins/wrapped-bitcoin)
-🦊 Contract: `0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599`
-📁 GitHub: [github.com/WrappedBTC](https://github.com/WrappedBTC)
-🐦 Twitter: [@WrappedBTC](https://twitter.com/WrappedBTC)
-"""
-
-
-async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📖 About WBTC", callback_data="info_wbtc"),
-         InlineKeyboardButton("📜 Rules", callback_data="info_rules")],
-        [InlineKeyboardButton("❓ FAQ", callback_data="info_faq"),
-         InlineKeyboardButton("🔗 Links", callback_data="info_links")],
-        [InlineKeyboardButton("💰 Live Price", callback_data="info_price")],
+def time_keyboard(date_str):
+    rows, row = [], []
+    for hour in range(BOOKING_START, BOOKING_END):
+        row.append(InlineKeyboardButton(
+            f"{hour:02d}:00", callback_data=f"time_{date_str}_{hour:02d}00"
+        ))
+        if len(row) == 3:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton("Back", callback_data="back_date"),
+        InlineKeyboardButton("Cancel", callback_data="cancel"),
     ])
-    await update.message.reply_text(
-        "ℹ️ *WBTC Bot Info Menu* — choose a topic:",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=keyboard,
+    return InlineKeyboardMarkup(rows)
+
+
+async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").lower()
+    for w in text.split():
+        if w.startswith("@"):
+            text = text.replace(w, "").strip()
+    if "mint" in text:
+        context.user_data["type"] = "mint"
+        await update.message.reply_text("*WBTC MINT Request*\n\nPlease enter the *amount* (BTC):", parse_mode="Markdown")
+        return ASK_AMOUNT
+    if "burn" in text:
+        context.user_data["type"] = "burn"
+        await update.message.reply_text("*WBTC BURN Request*\n\nPlease enter the *amount* (BTC):", parse_mode="Markdown")
+        return ASK_AMOUNT
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Mint", callback_data="type_mint"),
+         InlineKeyboardButton("Burn", callback_data="type_burn")],
+        [InlineKeyboardButton("Cancel", callback_data="cancel")],
+    ])
+    await update.message.reply_text("*WBTC Support Bot*\n\nWhat would you like to do?", parse_mode="Markdown", reply_markup=kb)
+    return ASK_TYPE
+
+
+async def cb_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    if q.data == "cancel":
+        await q.edit_message_text("Cancelled."); context.user_data.clear(); return ConversationHandler.END
+    context.user_data["type"] = q.data.replace("type_", "")
+    await q.edit_message_text(f"*WBTC {context.user_data['type'].upper()} Request*\n\nPlease enter the *amount* (BTC):", parse_mode="Markdown")
+    return ASK_AMOUNT
+
+
+async def got_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["amount"] = update.message.text.strip()
+    await update.message.reply_text("Please enter your *wallet address*:", parse_mode="Markdown")
+    return ASK_WALLET
+
+
+async def got_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["wallet"] = update.message.text.strip()
+    await update.message.reply_text("Please enter your *email address*:", parse_mode="Markdown")
+    return ASK_EMAIL
+
+
+async def got_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["email"] = update.message.text.strip()
+    await update.message.reply_text("Please enter your *company / merchant name*:", parse_mode="Markdown")
+    return ASK_MERCHANT
+
+
+async def got_merchant(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["merchant"] = update.message.text.strip()
+    await update.message.reply_text("Select your *preferred date*:", parse_mode="Markdown", reply_markup=date_keyboard())
+    return ASK_DATE
+
+
+async def cb_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    if q.data == "cancel":
+        await q.edit_message_text("Cancelled."); context.user_data.clear(); return ConversationHandler.END
+    date_str = q.data.replace("date_", "")
+    context.user_data["date"] = date_str
+    await q.edit_message_text(f"Select a *time slot* for {date_str} (SGT):", parse_mode="Markdown", reply_markup=time_keyboard(date_str))
+    return ASK_TIME
+
+
+async def cb_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    if q.data == "cancel":
+        await q.edit_message_text("Cancelled."); context.user_data.clear(); return ConversationHandler.END
+    if q.data == "back_date":
+        await q.edit_message_text("Select your *preferred date*:", parse_mode="Markdown", reply_markup=date_keyboard())
+        return ASK_DATE
+    _, date_str, time_str = q.data.split("_")
+    hour = int(time_str[:2]); minute = int(time_str[2:])
+    y, m, d = map(int, date_str.split("-"))
+    context.user_data["datetime"] = SGT.localize(datetime(y, m, d, hour, minute))
+    data   = context.user_data
+    dt_str = data["datetime"].strftime("%d %b %Y, %I:%M %p SGT")
+    summary = (
+        f"*Confirm your request:*\n\n"
+        f"*Type:*      {data['type'].upper()}\n"
+        f"*Merchant:*  {data['merchant']}\n"
+        f"*Amount:*    {data['amount']} BTC\n"
+        f"*Wallet:*    `{data['wallet']}`\n"
+        f"*Email:*     {data['email']}\n"
+        f"*Date/Time:* {dt_str}\n"
     )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Confirm", callback_data="confirm"),
+        InlineKeyboardButton("Cancel",  callback_data="cancel"),
+    ]])
+    await q.edit_message_text(summary, parse_mode="Markdown", reply_markup=kb)
+    return ASK_CONFIRM
 
 
-async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_price(update.message.chat_id, context)
-
-
-async def send_price(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    if q.data == "cancel":
+        await q.edit_message_text("Cancelled."); context.user_data.clear(); return ConversationHandler.END
+    await q.edit_message_text("Creating your calendar invite...")
     try:
-        async with aiohttp.ClientSession() as session:
-            url = "https://api.coingecko.com/api/v3/simple/price"
-            params = {
-                "ids": "wrapped-bitcoin,bitcoin",
-                "vs_currencies": "usd",
-                "include_24hr_change": "true",
-                "include_market_cap": "true",
-            }
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                data = await resp.json()
-
-        wbtc = data.get("wrapped-bitcoin", {})
-        btc = data.get("bitcoin", {})
-
-        wbtc_price = wbtc.get("usd", 0)
-        wbtc_change = wbtc.get("usd_24h_change", 0)
-        wbtc_mcap = wbtc.get("usd_market_cap", 0)
-        btc_price = btc.get("usd", 0)
-
-        arrow = "🟢 ▲" if wbtc_change >= 0 else "🔴 ▼"
-        peg_diff = ((wbtc_price - btc_price) / btc_price * 100) if btc_price else 0
-
-        msg = (
-            f"💰 *WBTC Price*\n\n"
-            f"Price: *${wbtc_price:,.2f}*\n"
-            f"24h: {arrow} {abs(wbtc_change):.2f}%\n"
-            f"Market Cap: ${wbtc_mcap:,.0f}\n"
-            f"BTC Price: ${btc_price:,.2f}\n"
-            f"Peg Diff: {peg_diff:+.4f}%\n\n"
-            f"_Source: CoinGecko_"
+        data = context.user_data
+        link = create_calendar_event(data)
+        send_slack(data, link)
+        dt_str = data["datetime"].strftime("%d %b %Y, %I:%M %p SGT")
+        await q.edit_message_text(
+            f"*{data['type'].upper()} request booked!*\n\n"
+            f"*{dt_str}*\n\n"
+            f"Calendar invites sent to all attendees.\n"
+            f"Our team will be in touch shortly.\n\n"
+            f"[View Calendar Event]({link})",
+            parse_mode="Markdown"
         )
     except Exception as e:
-        logger.error(f"Price fetch error: {e}")
-        msg = "⚠️ Could not fetch price. Try again later."
-
-    await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.MARKDOWN)
-
-
-async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(RULES_TEXT, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        import traceback
+        logger.error(f"Event creation failed: {e}")
+        logger.error(traceback.format_exc())
+        await q.edit_message_text(f"Error: {str(e)[:300]}")
+    context.user_data.clear()
+    return ConversationHandler.END
 
 
-async def cmd_faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(FAQ_TEXT, parse_mode=ParseMode.MARKDOWN)
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Cancelled.")
+    context.user_data.clear()
+    return ConversationHandler.END
 
 
-async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(LINKS_TEXT, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=False)
-
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await cmd_info(update, context)
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    is_adm = await is_chat_admin(update, context)
-    text = (
-        "🤖 *WBTC Admin Bot — Commands*\n\n"
-        "📊 *Info Commands:*\n"
-        "/price — Live WBTC price\n"
-        "/info — Info menu\n"
-        "/rules — Community rules\n"
-        "/faq — Frequently asked questions\n"
-        "/links — Official links\n"
+def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, entry)],
+        states={
+            ASK_TYPE:     [CallbackQueryHandler(cb_type)],
+            ASK_AMOUNT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, got_amount)],
+            ASK_WALLET:   [MessageHandler(filters.TEXT & ~filters.COMMAND, got_wallet)],
+            ASK_EMAIL:    [MessageHandler(filters.TEXT & ~filters.COMMAND, got_email)],
+            ASK_MERCHANT: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_merchant)],
+            ASK_DATE:     [CallbackQueryHandler(cb_date)],
+            ASK_TIME:     [CallbackQueryHandler(cb_time)],
+            ASK_CONFIRM:  [CallbackQueryHandler(cb_confirm)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_cmd)],
+        per_chat=False,
+        per_user=True,
+        per_message=False,
     )
-    if is_adm:
-        text += (
-            "\n🛡 *Admin Commands:*\n"
-            "/ban — Ban a user (reply to their message)\n"
-            "/unban <user_id> — Unban a user\n"
-            "/mute [minutes] — Mute a user\n"
-            "/unmute — Unmute a user\n"
-            "/warn [reason] — Warn a user\n"
-            "/warnings — Check user's warning count\n"
-            "/del — Delete a message\n"
-            "/announce <text> — Post an announcement\n"
-        )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-
-# ─── Callback Query Handler ───────────────────────────────────────────────────
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    handlers = {
-        "info_wbtc": (WBTC_INFO, True),
-        "info_rules": (RULES_TEXT, False),
-        "info_faq": (FAQ_TEXT, False),
-        "info_links": (LINKS_TEXT, False),
-    }
-
-    if query.data in handlers:
-        text, preview = handlers[query.data]
-        await query.message.reply_text(
-            text,
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=not preview,
-        )
-    elif query.data == "info_price":
-        await send_price(query.message.chat_id, context)
-
-
-# ─── Main ─────────────────────────────────────────────────────────────────────
-
-def main() -> None:
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    # Info commands
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("info", cmd_info))
-    app.add_handler(CommandHandler("price", cmd_price))
-    app.add_handler(CommandHandler("rules", cmd_rules))
-    app.add_handler(CommandHandler("faq", cmd_faq))
-    app.add_handler(CommandHandler("links", cmd_links))
-
-    # Admin commands
-    app.add_handler(CommandHandler("ban", cmd_ban))
-    app.add_handler(CommandHandler("unban", cmd_unban))
-    app.add_handler(CommandHandler("mute", cmd_mute))
-    app.add_handler(CommandHandler("unmute", cmd_unmute))
-    app.add_handler(CommandHandler("warn", cmd_warn))
-    app.add_handler(CommandHandler("warnings", cmd_warnings))
-    app.add_handler(CommandHandler("del", cmd_delete))
-    app.add_handler(CommandHandler("announce", cmd_announce))
-
-    # Inline buttons
-    app.add_handler(CallbackQueryHandler(button_callback))
-
-    # Welcome new members
-    app.add_handler(ChatMemberHandler(welcome_new_member, ChatMemberHandler.CHAT_MEMBER))
-
-    # Spam moderation (all text messages)
-    app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, moderate_message))
-
-    logger.info("🤖 WBTC Bot is running...")
+    app.add_handler(conv)
+    logger.info("WBTC Bot running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
